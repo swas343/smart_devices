@@ -69,12 +69,12 @@ export default function HomeScreen() {
         }
 
         // Set device as offline if no heartbeat received within 30 seconds
-        const timeout = setTimeout(() => {
-          setDeviceStatus("offline");
-          addLog("Device timeout - marked as offline");
-        }, 30000);
+        // const timeout = setTimeout(() => {
+        //   setDeviceStatus("offline");
+        //   addLog("Device timeout - marked as offline");
+        // }, 30000);
 
-        setDeviceTimeout(timeout);
+        // setDeviceTimeout(timeout);
       } else {
         // Listen for socket status updates on the status topics
         if (topic.startsWith(STATUS_BASE)) {
