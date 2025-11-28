@@ -25,14 +25,15 @@ export function getMQTTClient() {
 
 function connectWithFallback() {
   if (currentUrlIndex >= MQTT_URLS.length) {
-    console.error("All MQTT connection attempts failed");
+    console.error("All MQTT connection attempts failed. Tried URLs:", MQTT_URLS);
     isConnecting = false;
+    currentUrlIndex = 0; // Reset for potential retry
     return;
   }
 
   const url = MQTT_URLS[currentUrlIndex];
   console.log(
-    `Attempting MQTT connection to ${url} (attempt ${currentUrlIndex + 1})`
+    `Attempting MQTT connection to ${url} (attempt ${currentUrlIndex + 1}/${MQTT_URLS.length})`
   );
 
   try {
@@ -47,6 +48,11 @@ function connectWithFallback() {
       protocolVersion: 4 as const,
       username: 'hivemq.webclient.1763386015250',
       password: 'la7Dz6vZ3Rq%F:YU.;4n',
+      will: {
+        topic: 'device/status/client',
+        payload: 'offline',
+        retain: true
+      }
     };
 
     client = mqtt.connect(url, options);
@@ -58,24 +64,26 @@ function connectWithFallback() {
         client = null;
       }
       currentUrlIndex++;
-      connectWithFallback();
+      setTimeout(() => connectWithFallback(), 1000); // Add delay between attempts
     }, 15000);
 
     client.on("connect", () => {
       clearTimeout(connectionTimeout);
       console.log(`MQTT Connected successfully to ${url}`);
       isConnecting = false;
-      currentUrlIndex = 0; // Reset for next time
+      // Don't reset currentUrlIndex - remember which URL worked
 
-      // Subscribe to topics
-      client?.subscribe(`${CONTROL_BASE}#`);
-      client?.subscribe(`${STATUS_BASE}#`);
-      client?.subscribe("esp32/status");
+      // Subscribe to topics with QoS 1 for better reliability
+      // client?.subscribe(`${CONTROL_BASE}#`, { qos: 1 });
+      client?.subscribe(`${STATUS_BASE}#`, { qos: 1 });
+      client?.subscribe("device/status/#", { qos: 1 });
+      
+      console.log("Subscribed to topics:", [`${STATUS_BASE}#`, "device/status/#"]);
     });
 
     client.on("error", (err) => {
       clearTimeout(connectionTimeout);
-      console.error(`MQTT Error with ${url}:`, err);
+      console.error(`MQTT Error with ${url}:`, err.message || err);
 
       // Try next URL
       if (client) {
@@ -83,11 +91,11 @@ function connectWithFallback() {
         client = null;
       }
       currentUrlIndex++;
-      connectWithFallback();
+      setTimeout(() => connectWithFallback(), 1000); // Add delay between attempts
     });
 
-    client.on("disconnect", () => {
-      console.log("MQTT Disconnected");
+    client.on("disconnect", (packet) => {
+      console.log("MQTT Disconnected", packet);
       isConnecting = false;
     });
 
@@ -107,7 +115,7 @@ function connectWithFallback() {
   } catch (error) {
     console.error(`Failed to create MQTT client for ${url}:`, error);
     currentUrlIndex++;
-    connectWithFallback();
+    setTimeout(() => connectWithFallback(), 1000); // Add delay between attempts
   }
 }
 
@@ -119,4 +127,23 @@ export function disconnectMQTT() {
     isConnecting = false;
     currentUrlIndex = 0;
   }
+}
+
+// Function to retry connection manually
+export function retryMQTTConnection() {
+  console.log("Manual MQTT connection retry requested");
+  disconnectMQTT();
+  currentUrlIndex = 0;
+  isConnecting = false;
+  return getMQTTClient();
+}
+
+// Function to get connection status
+export function getMQTTConnectionStatus() {
+  return {
+    isConnected: client?.connected || false,
+    isConnecting,
+    currentUrl: currentUrlIndex < MQTT_URLS.length ? MQTT_URLS[currentUrlIndex] : null,
+    attemptedUrls: MQTT_URLS.slice(0, currentUrlIndex)
+  };
 }

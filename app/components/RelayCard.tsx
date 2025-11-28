@@ -12,13 +12,21 @@ export default function RelayCard() {
 
   useEffect(() => {
     if (!client) return;
+    
     // Define message handler
-    client.on("message", (topic, msg) => {
+    const messageHandler = (topic: string, msg: Buffer) => {
       if (topic === command) {
         setRelayState(msg.toString());
       }
-    });
-  }, []);
+    };
+    
+    client.on("message", messageHandler);
+    
+    return () => {
+      // Clean up this component's event listener
+      client.off("message", messageHandler);
+    };
+  }, [client]);
 
   const toggleRelay = () => {
     if (!client) return;

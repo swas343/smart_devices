@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { Card, Text, Switch, Group } from "@mantine/core";
+import { Card, Text, Switch, Group, Button } from "@mantine/core";
 import { SocketName, SocketState } from "../types";
 import { getMQTTClient } from "../mqtt/client";
-import { CONTROL_BASE, STATUS_BASE } from "../constants";
+import { CONTROL_BASE, DEVICE_STATUS, STATUS_BASE } from "../constants";
 
 const initialSockets: SocketState = {
   socket1: "off",
@@ -16,6 +16,9 @@ export default function HomeScreen() {
   const client = getMQTTClient();
   const [deviceStatus, setDeviceStatus] = useState("offline");
   const [socketStatus, setSocketStatus] = useState<SocketState>(initialSockets);
+  const [deviceTimeout, setDeviceTimeout] = useState<NodeJS.Timeout | null>(
+    null
+  );
   const [socketLoading, setSocketLoading] = useState<
     Record<SocketName, boolean>
   >({
@@ -31,8 +34,11 @@ export default function HomeScreen() {
 
   const getDeviceStatus = useCallback(() => {
     if (!client) return;
-    client.publish("esp32/status/request", "STATUS");
-    addLog("Sent → esp32/status/request: STATUS");
+
+    // Request fresh status
+    const topic = DEVICE_STATUS + "get";
+    client.publish(topic, "STATUS");
+    addLog(`Sent → ${topic}: STATUS`);
   }, [client, addLog]);
 
   const getSocketStatuses = useCallback(() => {
@@ -40,78 +46,92 @@ export default function HomeScreen() {
     // Request status for all sockets
     const sockets: SocketName[] = ["socket1", "socket2", "socket3"];
     sockets.forEach((socketName) => {
-      client.publish(`${STATUS_BASE}request/${socketName}`, "STATUS");
-      addLog(`Sent → ${STATUS_BASE}request/${socketName}: STATUS`);
+      // Request fresh status
+      client.publish(`${STATUS_BASE}get/${socketName}`, "STATUS");
+      addLog(`Sent → ${STATUS_BASE}get/${socketName}: STATUS`);
     });
   }, [client, addLog]);
 
   useEffect(() => {
     if (!client) return;
 
-    client.on("message", (topic: string, message: Buffer) => {
+    const messageHandler = (topic: string, message: Buffer) => {
       const payload = message.toString();
       addLog(`Received → ${topic}: ${payload}`);
-      if (topic === "esp32/status") {
+
+      // Listen for device status updates
+      if (topic === DEVICE_STATUS) {
         setDeviceStatus(payload);
-      }
 
-      // Listen for socket status updates on the status topics
-      if (topic.startsWith(STATUS_BASE)) {
-        const sock = topic.split("/").pop() as SocketName;
-        if (
-          sock &&
-          (sock === "socket1" || sock === "socket2" || sock === "socket3")
-        ) {
-          setSocketStatus((prev) => ({
-            ...prev,
-            [sock]: payload.toLowerCase() as "on" | "off",
-          }));
-          // Clear loading state when we receive a status update
-          setSocketLoading((prev) => ({
-            ...prev,
-            [sock]: false,
-          }));
+        // Clear any existing timeout
+        if (deviceTimeout) {
+          clearTimeout(deviceTimeout);
         }
-      }
 
-      // Also listen for control confirmations (when ESP32 confirms a control command)
-      if (topic.startsWith(CONTROL_BASE)) {
-        const sock = topic.split("/").pop() as SocketName;
-        if (
-          sock &&
-          (sock === "socket1" || sock === "socket2" || sock === "socket3")
-        ) {
-          setSocketStatus((prev) => ({
-            ...prev,
-            [sock]: payload.toLowerCase() as "on" | "off",
-          }));
-          // Clear loading state when we receive a status update
-          setSocketLoading((prev) => ({
-            ...prev,
-            [sock]: false,
-          }));
+        // Set device as offline if no heartbeat received within 30 seconds
+        const timeout = setTimeout(() => {
+          setDeviceStatus("offline");
+          addLog("Device timeout - marked as offline");
+        }, 30000);
+
+        setDeviceTimeout(timeout);
+      } else {
+        // Listen for socket status updates on the status topics
+        if (topic.startsWith(STATUS_BASE)) {
+          const topicParts = topic.split("/");
+          const sock = topicParts[topicParts.length - 1] as SocketName;
+
+          if (
+            sock &&
+            (sock === "socket1" || sock === "socket2" || sock === "socket3")
+          ) {
+            const normalizedPayload = payload.toLowerCase().trim();
+            // addLog(`Debug → Normalized payload: "${normalizedPayload}"`);
+
+            if (normalizedPayload === "on" || normalizedPayload === "off") {
+              setSocketStatus((prev) => ({
+                ...prev,
+                [sock]: normalizedPayload as "on" | "off",
+              }));
+              // Clear loading state when we receive a status update
+              setSocketLoading((prev) => ({
+                ...prev,
+                [sock]: false,
+              }));
+            } else {
+              addLog(
+                `Warning → Invalid payload "${payload}" for socket ${sock}`
+              );
+            }
+          } else {
+            addLog(
+              `Warning → Invalid socket name "${sock}" from topic ${topic}`
+            );
+          }
         }
-      }
-    });
-
-    return () => {
-      if (client) {
-        client.end();
       }
     };
-  }, [client, addLog]); // Include addLog in dependencies
+
+    client.on("message", messageHandler);
+
+    return () => {
+      // Only remove this component's listener, don't close the shared connection
+      client.off("message", messageHandler);
+      if (deviceTimeout) {
+        clearTimeout(deviceTimeout);
+      }
+    };
+  }, [client, addLog, deviceTimeout]); // Include addLog in dependencies
 
   // Pre-populate status on component load
   useEffect(() => {
     if (!client) return;
 
     // Use a timeout to avoid the setState synchronously within effect warning
-    const timeoutId = setTimeout(() => {
+    setTimeout(() => {
       getDeviceStatus();
       getSocketStatuses();
-    }, 100);
-
-    return () => clearTimeout(timeoutId);
+    }, 0);
   }, [client, getDeviceStatus, getSocketStatuses]);
 
   const toggleSocket = (socketName: SocketName, turnOn: boolean) => {
@@ -128,12 +148,6 @@ export default function HomeScreen() {
 
     client.publish(topic, cmd);
     addLog(`Sent → ${topic}: ${cmd}`);
-
-    // Optimistically update the UI
-    // setSocketStatus((prev) => ({
-    //   ...prev,
-    //   [socketName]: turnOn ? "on" : "off",
-    // }));
 
     // Clear loading state after 3 seconds if no response
     setTimeout(() => {
@@ -154,6 +168,8 @@ export default function HomeScreen() {
             {deviceStatus}
           </span>
         </Text>
+        <Button onClick={() => setLogs([])}>Clear logs</Button>
+        <Button onClick={getDeviceStatus}>Get device status</Button>
       </Card>
 
       {Object.keys(socketStatus).map((sock) => {
