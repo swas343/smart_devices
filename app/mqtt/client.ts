@@ -1,7 +1,6 @@
 "use client";
 
 import mqtt, { MqttClient } from "mqtt";
-import { CONTROL_BASE, STATUS_BASE } from "../constants";
 
 let client: MqttClient | null = null;
 let isConnecting = false;
@@ -71,14 +70,8 @@ function connectWithFallback() {
       clearTimeout(connectionTimeout);
       console.log(`MQTT Connected successfully to ${url}`);
       isConnecting = false;
-      // Don't reset currentUrlIndex - remember which URL worked
-
-      // Subscribe to topics with QoS 1 for better reliability
-      // client?.subscribe(`${CONTROL_BASE}#`, { qos: 1 });
-      client?.subscribe(`${STATUS_BASE}#`, { qos: 1 });
-      client?.subscribe("device/status/#", { qos: 1 });
-      
-      console.log("Subscribed to topics:", [`${STATUS_BASE}#`, "device/status/#"]);
+      // Topic subscriptions are managed per-device by the HomeScreen component.
+      // No hardcoded subscriptions here.
     });
 
     client.on("error", (err) => {

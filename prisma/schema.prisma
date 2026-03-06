@@ -1,0 +1,44 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  role         String   @default("user") // "admin" | "user"
+  devices      Device[]
+  createdAt    DateTime @default(now())
+}
+
+model Device {
+  id        String     @id @default(cuid())
+  /// The hardware ID string flashed onto the ESP32 via DEVICE_ID in credentials.h
+  deviceId  String     @unique
+  name      String
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  schedules Schedule[]
+  createdAt DateTime   @default(now())
+}
+
+model Schedule {
+  id           String   @id @default(cuid())
+  /// FK → Device.id (the Prisma-generated cuid, NOT the ESP32 deviceId string)
+  deviceId     String
+  device       Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  socketNumber Int      // 1–4
+  /// "repeating_daily" | "one_time"
+  type         String
+  /// "HH:MM" for repeating_daily, ISO 8601 datetime for one_time
+  triggerAt    String
+  /// "on" | "off"
+  action       String
+  enabled      Boolean  @default(true)
+  createdAt    DateTime @default(now())
+}

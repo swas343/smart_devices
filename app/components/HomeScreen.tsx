@@ -1,228 +1,281 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
-import { Card, Text, Switch, Group, Button } from "@mantine/core";
-import { SocketName, SocketState } from "../types";
+import { useEffect, useState, useCallback, useRef } from "react";
+import {
+  Card,
+  Text,
+  Switch,
+  Group,
+  Button,
+  Select,
+  Title,
+  Badge,
+  Stack,
+} from "@mantine/core";
+import { useSession, signOut } from "next-auth/react";
+import { SocketName, SocketState, Device } from "../types";
 import { getMQTTClient } from "../mqtt/client";
-import { CONTROL_BASE, DEVICE_STATUS, STATUS_BASE } from "../constants";
+import { SOCKET_NAMES, getTopics } from "../constants";
+import ScheduleManager from "./ScheduleManager";
 
 const initialSockets: SocketState = {
   socket1: "off",
   socket2: "off",
   socket3: "off",
+  socket4: "off",
+};
+
+const initialLoading: Record<SocketName, boolean> = {
+  socket1: false,
+  socket2: false,
+  socket3: false,
+  socket4: false,
 };
 
 export default function HomeScreen() {
-  const client = getMQTTClient();
-  const [deviceStatus, setDeviceStatus] = useState("offline");
-  const [socketStatus, setSocketStatus] = useState<SocketState>(initialSockets);
-  const [deviceTimeout, setDeviceTimeout] = useState<NodeJS.Timeout | null>(
-    null
-  );
-  const [socketLoading, setSocketLoading] = useState<
-    Record<SocketName, boolean>
-  >({
-    socket1: false,
-    socket2: false,
-    socket3: false,
-  });
-  const [logs, setLogs] = useState<string[]>([]);
+  const { data: session } = useSession();
+
+  const [devices, setDevices]               = useState<Device[]>([]);
+  const [activeDeviceId, setActiveDeviceId] = useState<string | null>(null);
+  const [deviceStatus, setDeviceStatus]     = useState("offline");
+  const [socketStatus, setSocketStatus]     = useState<SocketState>(initialSockets);
+  const [socketLoading, setSocketLoading]   = useState<Record<SocketName, boolean>>(initialLoading);
+  const [logs, setLogs]                     = useState<string[]>([]);
+
+  // Keep a ref so the MQTT message closure always reads the latest activeDeviceId
+  const activeDeviceRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeDeviceRef.current = activeDeviceId;
+  }, [activeDeviceId]);
 
   const addLog = useCallback((msg: string) => {
-    setLogs((prev) => [...prev, `${new Date().toLocaleTimeString()} — ${msg}`]);
+    setLogs((prev) => [...prev.slice(-199), `${new Date().toLocaleTimeString()} — ${msg}`]);
   }, []);
 
-  const getDeviceStatus = useCallback(() => {
-    if (!client) return;
-
-    // Request fresh status
-    const topic = DEVICE_STATUS + "get";
-    client.publish(topic, "STATUS");
-    addLog(`Sent → ${topic}: STATUS`);
-  }, [client, addLog]);
-
-  const getSocketStatuses = useCallback(() => {
-    if (!client) return;
-    // Request status for all sockets
-    const sockets: SocketName[] = ["socket1", "socket2", "socket3"];
-    sockets.forEach((socketName) => {
-      // Request fresh status
-      client.publish(`${STATUS_BASE}get/${socketName}`, "STATUS");
-      addLog(`Sent → ${STATUS_BASE}get/${socketName}: STATUS`);
-    });
-  }, [client, addLog]);
-
+  // ----------------------------------------------------------
+  // Fetch devices for the signed-in user
+  // ----------------------------------------------------------
   useEffect(() => {
-    if (!client) return;
+    if (!session?.user) return;
+    fetch("/api/devices")
+      .then((r) => r.json())
+      .then((data: Device[]) => {
+        setDevices(data);
+        if (data.length > 0) setActiveDeviceId(data[0].id);
+      })
+      .catch((err) => addLog(`Failed to load devices: ${err.message}`));
+  }, [session, addLog]);
+
+  // ----------------------------------------------------------
+  // Subscribe/unsubscribe and request initial state per device
+  // ----------------------------------------------------------
+  useEffect(() => {
+    const mqttClient = getMQTTClient();
+    if (!mqttClient || !activeDeviceId) return;
+
+    const device = devices.find((d) => d.id === activeDeviceId);
+    if (!device) return;
+
+    const topics = getTopics(device.deviceId);
+
+    // Reset UI state for the newly selected device
+    setDeviceStatus("offline");
+    setSocketStatus(initialSockets);
+    setSocketLoading(initialLoading);
+
+    mqttClient.subscribe(topics.statusAll, { qos: 1 });
+    mqttClient.subscribe(topics.deviceStatus, { qos: 1 });
+
+    // Request fresh state after a tick
+    setTimeout(() => {
+      mqttClient.publish(topics.deviceStatusGet, "STATUS");
+      SOCKET_NAMES.forEach((sock) => {
+        mqttClient.publish(`${topics.statusGetBase}${sock}`, "STATUS");
+      });
+      addLog(`Requesting state for ${device.name}`);
+    }, 0);
+
+    return () => {
+      mqttClient.unsubscribe(topics.statusAll);
+      mqttClient.unsubscribe(topics.deviceStatus);
+    };
+  }, [activeDeviceId, devices]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ----------------------------------------------------------
+  // MQTT message handler
+  // ----------------------------------------------------------
+  useEffect(() => {
+    const mqttClient = getMQTTClient();
+    if (!mqttClient) return;
 
     const messageHandler = (topic: string, message: Buffer) => {
       const payload = message.toString();
       addLog(`Received → ${topic}: ${payload}`);
 
-      // Listen for device status updates
-      if (topic === DEVICE_STATUS) {
+      const device = devices.find((d) => d.id === activeDeviceRef.current);
+      if (!device) return;
+
+      const topics = getTopics(device.deviceId);
+
+      if (topic === topics.deviceStatus) {
         setDeviceStatus(payload);
+        return;
+      }
 
-        // Clear any existing timeout
-        if (deviceTimeout) {
-          clearTimeout(deviceTimeout);
-        }
-
-        // Set device as offline if no heartbeat received within 30 seconds
-        // const timeout = setTimeout(() => {
-        //   setDeviceStatus("offline");
-        //   addLog("Device timeout - marked as offline");
-        // }, 30000);
-
-        // setDeviceTimeout(timeout);
-      } else {
-        // Listen for socket status updates on the status topics
-        if (topic.startsWith(STATUS_BASE)) {
-          const topicParts = topic.split("/");
-          const sock = topicParts[topicParts.length - 1] as SocketName;
-
-          if (
-            sock &&
-            (sock === "socket1" || sock === "socket2" || sock === "socket3")
-          ) {
-            const normalizedPayload = payload.toLowerCase().trim();
-            // addLog(`Debug → Normalized payload: "${normalizedPayload}"`);
-
-            if (normalizedPayload === "on" || normalizedPayload === "off") {
-              setSocketStatus((prev) => ({
-                ...prev,
-                [sock]: normalizedPayload as "on" | "off",
-              }));
-              // Clear loading state when we receive a status update
-              setSocketLoading((prev) => ({
-                ...prev,
-                [sock]: false,
-              }));
-            } else {
-              addLog(
-                `Warning → Invalid payload "${payload}" for socket ${sock}`
-              );
-            }
-          } else {
-            addLog(
-              `Warning → Invalid socket name "${sock}" from topic ${topic}`
-            );
+      if (topic.startsWith(topics.statusBase)) {
+        const parts = topic.split("/");
+        const sock  = parts[parts.length - 1] as SocketName;
+        if (SOCKET_NAMES.includes(sock as (typeof SOCKET_NAMES)[number])) {
+          const norm = payload.toLowerCase().trim() as "on" | "off";
+          if (norm === "on" || norm === "off") {
+            setSocketStatus((prev) => ({ ...prev, [sock]: norm }));
+            setSocketLoading((prev) => ({ ...prev, [sock]: false }));
           }
         }
       }
     };
 
-    client.on("message", messageHandler);
+    mqttClient.on("message", messageHandler);
+    return () => { mqttClient.off("message", messageHandler); };
+  }, [devices, addLog]);
 
-    return () => {
-      // Only remove this component's listener, don't close the shared connection
-      client.off("message", messageHandler);
-      if (deviceTimeout) {
-        clearTimeout(deviceTimeout);
-      }
-    };
-  }, [client, addLog, deviceTimeout]); // Include addLog in dependencies
-
-  // Pre-populate status on component load
-  useEffect(() => {
-    if (!client) return;
-
-    // Use a timeout to avoid the setState synchronously within effect warning
-    setTimeout(() => {
-      getDeviceStatus();
-      getSocketStatuses();
-    }, 0);
-  }, [client, getDeviceStatus, getSocketStatuses]);
-
+  // ----------------------------------------------------------
+  // Toggle a socket
+  // ----------------------------------------------------------
   const toggleSocket = (socketName: SocketName, turnOn: boolean) => {
-    if (!client) return;
+    const mqttClient = getMQTTClient();
+    if (!mqttClient) return;
 
-    // Set loading state
-    setSocketLoading((prev) => ({
-      ...prev,
-      [socketName]: true,
-    }));
+    const device = devices.find((d) => d.id === activeDeviceId);
+    if (!device) return;
 
-    const topic = `${CONTROL_BASE}${socketName}`;
-    const cmd = turnOn ? "ON" : "OFF";
+    const topics = getTopics(device.deviceId);
+    const topic  = `${topics.controlBase}${socketName}`;
+    const cmd    = turnOn ? "ON" : "OFF";
 
-    client.publish(topic, cmd);
+    setSocketLoading((prev) => ({ ...prev, [socketName]: true }));
+    mqttClient.publish(topic, cmd);
     addLog(`Sent → ${topic}: ${cmd}`);
 
-    // Clear loading state after 3 seconds if no response
+    // Fallback: clear loading after 3 s if no echo arrives
     setTimeout(() => {
-      setSocketLoading((prev) => ({
-        ...prev,
-        [socketName]: false,
-      }));
+      setSocketLoading((prev) => ({ ...prev, [socketName]: false }));
     }, 3000);
   };
 
+  const activeDevice = devices.find((d) => d.id === activeDeviceId) ?? null;
+
   return (
-    <div style={{ padding: 20, maxWidth: 500, margin: "0 auto" }}>
-      <h1>Smart Extension</h1>
-      <Card withBorder padding="lg" shadow="sm">
-        <Text size="lg">
-          Device Status:{" "}
-          <span style={{ color: deviceStatus === "online" ? "green" : "red" }}>
-            {deviceStatus}
-          </span>
-        </Text>
-        <Button onClick={() => setLogs([])}>Clear logs</Button>
-        <Button onClick={getDeviceStatus}>Get device status</Button>
+    <div style={{ padding: 20, maxWidth: 560, margin: "0 auto" }}>
+      {/* Header */}
+      <Group justify="space-between" align="center" mb="md">
+        <Title order={2}>Smart Extension</Title>
+        <Group gap="xs">
+          <Text size="sm" c="dimmed">{session?.user?.email}</Text>
+          <Button variant="subtle" size="xs" onClick={() => signOut()}>
+            Sign out
+          </Button>
+        </Group>
+      </Group>
+
+      {/* Device selector */}
+      {devices.length > 0 && (
+        <Select
+          label="Active device"
+          placeholder="Select a device"
+          data={devices.map((d) => ({ value: d.id, label: d.name }))}
+          value={activeDeviceId}
+          onChange={setActiveDeviceId}
+          mb="md"
+        />
+      )}
+      {devices.length === 0 && (
+        <Card withBorder padding="md" mb="md">
+          <Text c="dimmed">
+            No devices assigned to your account. Ask an admin to register one.
+          </Text>
+        </Card>
+      )}
+
+      {/* Device status bar */}
+      <Card withBorder padding="lg" shadow="sm" mb="md">
+        <Group justify="space-between" align="center">
+          <Text size="lg">
+            Device status:{" "}
+            <Badge color={deviceStatus === "online" ? "green" : "red"}>
+              {deviceStatus}
+            </Badge>
+          </Text>
+          <Group gap="xs">
+            <Button
+              size="xs"
+              variant="light"
+              disabled={!activeDevice}
+              onClick={() => {
+                const mqttClient = getMQTTClient();
+                if (!mqttClient || !activeDevice) return;
+                const topics = getTopics(activeDevice.deviceId);
+                mqttClient.publish(topics.deviceStatusGet, "STATUS");
+                addLog("Requested device status");
+              }}
+            >
+              Refresh
+            </Button>
+            <Button size="xs" variant="light" color="gray" onClick={() => setLogs([])}>
+              Clear logs
+            </Button>
+          </Group>
+        </Group>
       </Card>
 
-      {Object.keys(socketStatus).map((sock) => {
-        const socketName = sock as SocketName;
-        return (
+      {/* Socket cards */}
+      <Stack gap="sm">
+        {SOCKET_NAMES.map((socketName) => (
           <Card
-            key={sock}
+            key={socketName}
             withBorder
             padding="md"
             shadow="sm"
-            style={{
-              marginTop: 20,
-              opacity: deviceStatus === "offline" ? 0.6 : 1,
-              position: "relative",
-            }}
+            style={{ opacity: deviceStatus === "offline" ? 0.6 : 1 }}
           >
-            <Text size="lg" fw={700}>
-              {socketName.toUpperCase()}
-            </Text>
-
-            <Group
-              justify="space-between"
-              align="center"
-              style={{ marginTop: 10 }}
-            >
-              <Text
-                size="sm"
-                c={socketStatus[socketName] === "on" ? "green" : "gray"}
-              >
-                Status:{" "}
-                {socketLoading[socketName]
-                  ? "Switching..."
-                  : socketStatus[socketName].toUpperCase()}
+            <Group justify="space-between" align="center">
+              <Text size="lg" fw={700}>
+                {socketName.toUpperCase()}
               </Text>
-              <Switch
-                checked={socketStatus[socketName] === "on"}
-                onChange={(event) =>
-                  toggleSocket(socketName, event.currentTarget.checked)
-                }
-                label={socketStatus[socketName] === "on" ? "ON" : "OFF"}
-                color="blue"
-                size="md"
-                disabled={
-                  socketLoading[socketName] || deviceStatus === "offline"
-                }
-              />
+              <Group gap="md" align="center">
+                <Text
+                  size="sm"
+                  c={socketStatus[socketName] === "on" ? "green" : "gray"}
+                >
+                  {socketLoading[socketName]
+                    ? "Switching…"
+                    : socketStatus[socketName].toUpperCase()}
+                </Text>
+                <Switch
+                  checked={socketStatus[socketName] === "on"}
+                  onChange={(e) => toggleSocket(socketName, e.currentTarget.checked)}
+                  label={socketStatus[socketName] === "on" ? "ON" : "OFF"}
+                  color="blue"
+                  size="md"
+                  disabled={
+                    socketLoading[socketName] ||
+                    deviceStatus === "offline"  ||
+                    !activeDevice
+                  }
+                />
+              </Group>
             </Group>
           </Card>
-        );
-      })}
+        ))}
+      </Stack>
 
-      {/* Logs Viewer */}
-      <h3 style={{ marginTop: 30 }}>Logs</h3>
+      {/* Schedule manager */}
+      {activeDevice && <ScheduleManager device={activeDevice} />}
+
+      {/* Logs viewer */}
+      <Text fw={600} mt="xl" mb="xs">
+        Logs
+      </Text>
       <div
         style={{
           height: 200,
@@ -231,8 +284,14 @@ export default function HomeScreen() {
           padding: 10,
           borderRadius: 8,
           fontFamily: "monospace",
+          fontSize: 12,
         }}
       >
+        {logs.length === 0 && (
+          <Text c="dimmed" size="xs">
+            No activity yet
+          </Text>
+        )}
         {logs.map((l, i) => (
           <div key={i}>{l}</div>
         ))}
@@ -240,3 +299,4 @@ export default function HomeScreen() {
     </div>
   );
 }
+
