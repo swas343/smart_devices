@@ -1,10 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/app/lib/prisma";
+import { PrismaClient } from "@prisma/client";
+import { getPrisma } from "@/app/lib/prisma";
 import { serverPublish } from "@/app/lib/mqtt-server";
 
-async function pushSchedulesToDevice(prismaDeviceId: string, esp32DeviceId: string) {
+async function pushSchedulesToDevice(
+  prisma: PrismaClient,
+  prismaDeviceId: string,
+  esp32DeviceId: string
+) {
   const schedules = await prisma.schedule.findMany({
     where: { deviceId: prismaDeviceId },
     orderBy: { createdAt: "asc" },
@@ -36,6 +41,8 @@ export async function PATCH(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const prisma = getPrisma();
+
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -65,7 +72,7 @@ export async function PATCH(
     },
   });
 
-  await pushSchedulesToDevice(existing.deviceId, existing.device.deviceId);
+  await pushSchedulesToDevice(prisma, existing.deviceId, existing.device.deviceId);
 
   return NextResponse.json(updated);
 }
@@ -77,6 +84,8 @@ export async function DELETE(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const prisma = getPrisma();
+
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -95,7 +104,7 @@ export async function DELETE(
 
   await prisma.schedule.delete({ where: { id } });
 
-  await pushSchedulesToDevice(existing.deviceId, existing.device.deviceId);
+  await pushSchedulesToDevice(prisma, existing.deviceId, existing.device.deviceId);
 
   return NextResponse.json({ success: true });
 }

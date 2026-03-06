@@ -1,14 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/lib/auth";
-import { prisma } from "@/app/lib/prisma";
+import { PrismaClient } from "@prisma/client";
+import { getPrisma } from "@/app/lib/prisma";
 import { serverPublish } from "@/app/lib/mqtt-server";
 
 // -------------------------------------------------------
 // Helper: push the full schedule list for a device to MQTT
 // so the ESP32 can update its local copy immediately.
 // -------------------------------------------------------
-async function pushSchedulesToDevice(prismaDeviceId: string, esp32DeviceId: string) {
+async function pushSchedulesToDevice(
+  prisma: PrismaClient,
+  prismaDeviceId: string,
+  esp32DeviceId: string
+) {
   const schedules = await prisma.schedule.findMany({
     where: { deviceId: prismaDeviceId },
     orderBy: { createdAt: "asc" },
@@ -35,7 +40,7 @@ async function pushSchedulesToDevice(prismaDeviceId: string, esp32DeviceId: stri
 }
 
 // Helper: verify the requesting user owns the given device
-async function getUserDevice(userId: string, prismaDeviceId: string) {
+async function getUserDevice(prisma: PrismaClient, userId: string, prismaDeviceId: string) {
   return prisma.device.findFirst({
     where: { id: prismaDeviceId, userId },
   });
@@ -45,6 +50,8 @@ async function getUserDevice(userId: string, prismaDeviceId: string) {
 // GET /api/schedules?deviceId=<prisma-device-id>
 // -------------------------------------------------------
 export async function GET(req: NextRequest) {
+  const prisma = getPrisma();
+
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -55,7 +62,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "deviceId query param required" }, { status: 400 });
   }
 
-  const device = await getUserDevice(session.user.id, deviceId);
+  const device = await getUserDevice(prisma, session.user.id, deviceId);
   if (!device) {
     return NextResponse.json({ error: "Device not found" }, { status: 404 });
   }
@@ -73,6 +80,8 @@ export async function GET(req: NextRequest) {
 // Body: { deviceId, socketNumber, type, triggerAt, action, enabled }
 // -------------------------------------------------------
 export async function POST(req: NextRequest) {
+  const prisma = getPrisma();
+
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -85,7 +94,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Missing required fields" }, { status: 400 });
   }
 
-  const device = await getUserDevice(session.user.id, deviceId);
+  const device = await getUserDevice(prisma, session.user.id, deviceId);
   if (!device) {
     return NextResponse.json({ error: "Device not found" }, { status: 404 });
   }
@@ -94,7 +103,7 @@ export async function POST(req: NextRequest) {
     data: { deviceId, socketNumber, type, triggerAt, action, enabled },
   });
 
-  await pushSchedulesToDevice(deviceId, device.deviceId);
+  await pushSchedulesToDevice(prisma, deviceId, device.deviceId);
 
   return NextResponse.json(schedule, { status: 201 });
 }
