@@ -32,6 +32,9 @@ const initialLoading: Record<SocketName, boolean> = {
   socket4: false,
 };
 
+const DEVICE_STALE_TIMEOUT_MS = 90_000;
+const DEVICE_STALE_CHECK_INTERVAL_MS = 5_000;
+
 export default function HomeScreen() {
   const { data: session } = useSession();
 
@@ -44,12 +47,21 @@ export default function HomeScreen() {
 
   // Keep a ref so the MQTT message closure always reads the latest activeDeviceId
   const activeDeviceRef = useRef<string | null>(null);
+  const lastSeenAtRef = useRef<number | null>(null);
   useEffect(() => {
     activeDeviceRef.current = activeDeviceId;
   }, [activeDeviceId]);
 
   const addLog = useCallback((msg: string) => {
     setLogs((prev) => [...prev.slice(-199), `${new Date().toLocaleTimeString()} — ${msg}`]);
+  }, []);
+
+  const selectActiveDevice = useCallback((nextDeviceId: string | null) => {
+    setActiveDeviceId(nextDeviceId);
+    setDeviceStatus("offline");
+    setSocketStatus(initialSockets);
+    setSocketLoading(initialLoading);
+    lastSeenAtRef.current = null;
   }, []);
 
   // ----------------------------------------------------------
@@ -61,10 +73,10 @@ export default function HomeScreen() {
       .then((r) => r.json())
       .then((data: Device[]) => {
         setDevices(data);
-        if (data.length > 0) setActiveDeviceId(data[0].id);
+        if (data.length > 0) selectActiveDevice(data[0].id);
       })
       .catch((err) => addLog(`Failed to load devices: ${err.message}`));
-  }, [session, addLog]);
+  }, [session, addLog, selectActiveDevice]);
 
   // ----------------------------------------------------------
   // Subscribe/unsubscribe and request initial state per device
@@ -77,11 +89,6 @@ export default function HomeScreen() {
     if (!device) return;
 
     const topics = getTopics(device.deviceId);
-
-    // Reset UI state for the newly selected device
-    setDeviceStatus("offline");
-    setSocketStatus(initialSockets);
-    setSocketLoading(initialLoading);
 
     mqttClient.subscribe(topics.statusAll, { qos: 1 });
     mqttClient.subscribe(topics.deviceStatus, { qos: 1 });
@@ -110,19 +117,33 @@ export default function HomeScreen() {
 
     const messageHandler = (topic: string, message: Buffer) => {
       const payload = message.toString();
-      addLog(`Received → ${topic}: ${payload}`);
 
       const device = devices.find((d) => d.id === activeDeviceRef.current);
       if (!device) return;
 
       const topics = getTopics(device.deviceId);
+      const isDeviceStatusGetEcho = topic === topics.deviceStatusGet;
+      const isSocketStatusGetEcho = topic.startsWith(topics.statusGetBase);
+
+      if (!isDeviceStatusGetEcho && !isSocketStatusGetEcho) {
+        addLog(`Received → ${topic}: ${payload}`);
+      }
 
       if (topic === topics.deviceStatus) {
-        setDeviceStatus(payload);
+        const normalized = payload.toLowerCase().trim();
+        if (normalized === "online") {
+          setDeviceStatus("online");
+          lastSeenAtRef.current = Date.now();
+        } else if (normalized === "offline") {
+          setDeviceStatus("offline");
+          lastSeenAtRef.current = null;
+        }
         return;
       }
 
       if (topic.startsWith(topics.statusBase)) {
+        if (isSocketStatusGetEcho) return;
+
         const parts = topic.split("/");
         const sock  = parts[parts.length - 1] as SocketName;
         if (SOCKET_NAMES.includes(sock as (typeof SOCKET_NAMES)[number])) {
@@ -130,6 +151,8 @@ export default function HomeScreen() {
           if (norm === "on" || norm === "off") {
             setSocketStatus((prev) => ({ ...prev, [sock]: norm }));
             setSocketLoading((prev) => ({ ...prev, [sock]: false }));
+            setDeviceStatus("online");
+            lastSeenAtRef.current = Date.now();
           }
         }
       }
@@ -138,6 +161,21 @@ export default function HomeScreen() {
     mqttClient.on("message", messageHandler);
     return () => { mqttClient.off("message", messageHandler); };
   }, [devices, addLog]);
+
+  useEffect(() => {
+    if (!activeDeviceId) return;
+
+    const intervalId = setInterval(() => {
+      const lastSeenAt = lastSeenAtRef.current;
+      if (!lastSeenAt) return;
+
+      if (Date.now() - lastSeenAt > DEVICE_STALE_TIMEOUT_MS) {
+        setDeviceStatus((prev) => (prev === "offline" ? prev : "offline"));
+      }
+    }, DEVICE_STALE_CHECK_INTERVAL_MS);
+
+    return () => clearInterval(intervalId);
+  }, [activeDeviceId]);
 
   // ----------------------------------------------------------
   // Toggle a socket
@@ -185,7 +223,7 @@ export default function HomeScreen() {
           placeholder="Select a device"
           data={devices.map((d) => ({ value: d.id, label: d.name }))}
           value={activeDeviceId}
-          onChange={setActiveDeviceId}
+          onChange={selectActiveDevice}
           mb="md"
         />
       )}
