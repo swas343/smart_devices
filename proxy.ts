@@ -8,5 +8,7 @@ export const proxy = withAuth({
 
 export const config = {
   // Protect every route except /login, next-auth API routes, Next.js internals, and static files
-  matcher: ["/((?!login|api/auth|_next/static|_next/image|favicon.ico).*)"],
+  matcher: [
+    "/((?!login|api/auth|api/db-health|_next/static|_next/image|favicon.ico).*)",
+  ],
 };
