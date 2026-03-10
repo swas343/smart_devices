@@ -73,7 +73,15 @@ export default function ScheduleManager({ device }: Props) {
     setSocketNumber("1");
     setType("repeating_daily");
     setTriggerAt("08:00");
-    setTriggerDate(new Date().toISOString().slice(0, 10));
+    // Use local date, not UTC date (toISOString() returns UTC and can be
+    // the previous calendar day for UTC+ timezones late at night).
+    const now = new Date();
+    const localDate = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0"),
+    ].join("-");
+    setTriggerDate(localDate);
     setAction("on");
     setEnabled(true);
     setModalOpen(true);
@@ -88,12 +96,25 @@ export default function ScheduleManager({ device }: Props) {
 
     if (s.type === "repeating_daily") {
       setTriggerAt(s.triggerAt);
-      setTriggerDate(new Date().toISOString().slice(0, 10));
+      const now = new Date();
+      const localDate = [
+        now.getFullYear(),
+        String(now.getMonth() + 1).padStart(2, "0"),
+        String(now.getDate()).padStart(2, "0"),
+      ].join("-");
+      setTriggerDate(localDate);
     } else {
       const dt = new Date(s.triggerAt);
-      setTriggerDate(dt.toISOString().slice(0, 10));
+      // Use local date/time methods — the stored value has no Z suffix so
+      // the Date object is already in local time.
+      const localDate = [
+        dt.getFullYear(),
+        String(dt.getMonth() + 1).padStart(2, "0"),
+        String(dt.getDate()).padStart(2, "0"),
+      ].join("-");
+      setTriggerDate(localDate);
       setTriggerAt(
-        `${String(dt.getUTCHours()).padStart(2, "0")}:${String(dt.getUTCMinutes()).padStart(2, "0")}`
+        `${String(dt.getHours()).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`
       );
     }
     setModalOpen(true);
@@ -104,7 +125,10 @@ export default function ScheduleManager({ device }: Props) {
   // ----------------------------------------------------------
   const buildTriggerAt = () => {
     if (type === "repeating_daily") return triggerAt; // "HH:MM"
-    return `${triggerDate}T${triggerAt}:00.000Z`;     // ISO 8601
+    // Store without a Z suffix so the value is treated as local time
+    // everywhere: in the browser's toLocaleString() display and on the
+    // ESP32 which compares the extracted HH:MM against its local NTP clock.
+    return `${triggerDate}T${triggerAt}:00`;
   };
 
   // ----------------------------------------------------------
@@ -203,7 +227,14 @@ export default function ScheduleManager({ device }: Props) {
                 <Text size="sm" c="dimmed" style={{ overflow: "hidden", textOverflow: "ellipsis" }}>
                   {s.type === "repeating_daily"
                     ? `Every day at ${s.triggerAt}`
-                    : `Once at ${new Date(s.triggerAt).toLocaleString()}`}
+                    : (() => {
+                        // Extract date and HH:MM literally from the stored string —
+                        // this matches exactly what the ESP32 fires on, and works
+                        // for both old records (with Z suffix) and new ones (without).
+                        const [datePart, timePart] = s.triggerAt.split("T");
+                        const hhmm = timePart?.slice(0, 5) ?? "";
+                        return `Once on ${datePart} at ${hhmm}`;
+                      })()}
                 </Text>
               </Stack>
 

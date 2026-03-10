@@ -5,6 +5,26 @@ import mqtt, { MqttClient } from "mqtt";
 let client: MqttClient | null = null;
 let isConnecting = false;
 
+// Tracks all currently-subscribed topics so they can be re-issued after reconnect.
+const subscribedTopics = new Set<string>();
+
+// Callbacks waiting for the client to be ready.
+type ConnectResolver = (c: MqttClient) => void;
+const connectWaiters: ConnectResolver[] = [];
+
+/** Resolves as soon as the MQTT client is connected. */
+export function whenConnected(): Promise<MqttClient> {
+  if (client?.connected) return Promise.resolve(client);
+  return new Promise<MqttClient>((resolve) => {
+    connectWaiters.push(resolve);
+    // Kick off the connection if nobody else has.
+    if (!isConnecting && !client) {
+      isConnecting = true;
+      connectWithFallback();
+    }
+  });
+}
+
 // Safari-compatible connection URLs
 const MQTT_URLS = [
   "wss://366796d2a3ee4bdc99cffee3d6420fa6.s1.eu.hivemq.cloud:8884/mqtt",
@@ -22,11 +42,49 @@ export function getMQTTClient() {
   return client;
 }
 
+/**
+ * Wrapper around client.subscribe that also registers the topic so it can be
+ * automatically re-subscribed after a broker-initiated reconnect.
+ */
+export function trackedSubscribe(
+  topic: string,
+  options?: { qos?: 0 | 1 | 2 }
+): void {
+  subscribedTopics.add(topic);
+  client?.subscribe(topic, { qos: options?.qos ?? 1 });
+}
+
+/**
+ * Wrapper around client.unsubscribe that also removes the topic from the
+ * tracked set so it won't be re-subscribed after reconnect.
+ */
+export function trackedUnsubscribe(topic: string): void {
+  subscribedTopics.delete(topic);
+  client?.unsubscribe(topic);
+}
+
+function resubscribeAll(): void {
+  if (!client?.connected || subscribedTopics.size === 0) return;
+  console.log(`[MQTT] Re-subscribing to ${subscribedTopics.size} topic(s) after reconnect`);
+  subscribedTopics.forEach((topic) => {
+    client!.subscribe(topic, { qos: 1 });
+  });
+}
+
 function connectWithFallback() {
   if (currentUrlIndex >= MQTT_URLS.length) {
     console.error("All MQTT connection attempts failed. Tried URLs:", MQTT_URLS);
     isConnecting = false;
-    currentUrlIndex = 0; // Reset for potential retry
+    currentUrlIndex = 0; // Reset for retry
+    // Retry from the top after a short back-off so that any pending
+    // whenConnected() promises (connectWaiters) eventually get resolved
+    // instead of being silently abandoned forever.
+    setTimeout(() => {
+      if (!client && connectWaiters.length > 0) {
+        isConnecting = true;
+        connectWithFallback();
+      }
+    }, 5000);
     return;
   }
 
@@ -70,6 +128,10 @@ function connectWithFallback() {
       clearTimeout(connectionTimeout);
       console.log(`MQTT Connected successfully to ${url}`);
       isConnecting = false;
+      // Drain any waiters that called whenConnected() before the socket was ready.
+      while (connectWaiters.length > 0) {
+        connectWaiters.shift()!(client!);
+      }
       // Topic subscriptions are managed per-device by the HomeScreen component.
       // No hardcoded subscriptions here.
     });
@@ -96,6 +158,12 @@ function connectWithFallback() {
       console.log("MQTT Reconnecting...");
     });
 
+    // After the library re-establishes the session, re-subscribe to all tracked topics.
+    // The "connect" event fires on every successful (re)connect.
+    client.on("connect", () => {
+      resubscribeAll();
+    });
+
     client.on("offline", () => {
       console.log("MQTT Client went offline");
       isConnecting = false;
@@ -119,6 +187,7 @@ export function disconnectMQTT() {
     client = null;
     isConnecting = false;
     currentUrlIndex = 0;
+    subscribedTopics.clear();
   }
 }
 
